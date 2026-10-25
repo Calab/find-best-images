@@ -1,5 +1,9 @@
 Find Best Images duplicates image files from one or more source directories to a target directory named "search-results". While duplicating it will try to identify similar images and try to retain the best quality image.
 
+You simply add one or more source directories to scan for images. Then select a target directory to put the "search-result" at. Select the options you wish to use and click the Start Scan button.
+
+If a match is found between two different sources, and the match is a tie, the image in the first source will be selected.
+
 There is an option to generate a ".dup" placeholder when a different image was selected to be a better quality. The .dup file contains the path to the selected image file.
 
 There is also an option to duplicate any other files it finds. It does not do any matching on these files.
