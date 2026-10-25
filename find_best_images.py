@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 find_best_images.py
 
@@ -9,9 +8,9 @@ copy the winners into a "search-result" directory that mirrors their original
 paths.
 
 By default the program opens a window. Any options given on the command line
-(-s, -t, --no-dup, --no-copy-other, --no-bad-files, --allow-sleep, --dry-run,
---threshold, --lossless-bonus) pre-fill the matching fields, and nothing runs
-until you press Start scan. The source list starts empty, and "Add folder..."
+(-s, -t, --no-subdirs, --no-dup, --no-copy-other, --no-bad-files,
+--allow-sleep, --require-same-size, --dry-run, --threshold, --lossless-bonus)
+pre-fill the matching fields, and nothing runs until you press Start scan. The source list starts empty, and "Add folder..."
 opens at ~/Pictures:
 
     python find_best_images.py
@@ -53,6 +52,9 @@ Also on by default: every non-image file found under the sources is copied into
 "search-result" (same relative path; skip with --no-copy-other), and each image
 that can't be read gets a "<name>.bad" file there holding its path and the
 error (skip with --no-bad-files).
+Two more options, both off by default: --no-subdirs scans only the top level of
+each source (not its sub-directories), and --require-same-size treats images
+whose file sizes differ as different images, even if they look identical.
 When the scan finishes, search-result/search-report.txt lists every group of
 look-alikes and whether each file was kept or not.
 
@@ -73,10 +75,12 @@ import math
 import multiprocessing
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -103,6 +107,9 @@ PHASES = ["Discovering", "Analysing", "Comparing", "Detail", "Copying"]
 DEFAULT_SOURCE = "~/Pictures"   # --no-gui fallback when no -s is given; also where
                                 # the window's "Add folder..." dialog opens
 DEFAULT_TARGET = "~"            # where 'search-result' is created when no -t is given
+APP_NAME = "Find Best Images"
+__version__ = "1.0.0"
+AI_NOTE = "This program was developed with the assistance of Claude AI."
 
 
 # --------------------------------------------------------------------------
@@ -391,6 +398,8 @@ class Options:
     dry_run: bool = False
     verbose: bool = False
     keep_awake: bool = True   # stop the computer sleeping while the scan runs
+    recurse: bool = True      # also scan the sub-directories of each source
+    same_size: bool = False   # images of different file sizes never match
     spawn: bool = False  # use 'spawn' worker processes (safer next to a GUI)
 
 
@@ -402,6 +411,7 @@ def gather_files(
     out_dir: Path,
     ui: ScanUI | None = None,
     collect_others: bool = False,
+    recurse: bool = True,
 ) -> tuple[dict[Path, Path], dict[Path, Path]]:
     """Return ({image: root}, {other_file: root}), skipping the output dir.
 
@@ -415,11 +425,14 @@ def gather_files(
     folders = 0
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if Path(os.path.abspath(os.path.join(dirpath, d))) != out_dir
-            ]
+            if recurse:
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if Path(os.path.abspath(os.path.join(dirpath, d))) != out_dir
+                ]
+            else:
+                dirnames[:] = []  # top level of each source only
             for name in filenames:
                 full = os.path.join(dirpath, name)
                 if os.path.splitext(name)[1].lower() in EXTENSIONS:
@@ -450,11 +463,16 @@ def destination_for(info: Info, base: Path, out_dir: Path) -> Path:
 # Grouping look-alikes
 # --------------------------------------------------------------------------
 def cluster(
-    infos: list[Info], threshold: int, ratio_tol: float, progress=None
+    infos: list[Info],
+    threshold: int,
+    ratio_tol: float,
+    progress=None,
+    same_size: bool = False,
 ) -> list[list[Info]]:
     """Union-find over images whose hashes are within `threshold` bits and whose
     aspect ratios agree within `ratio_tol`. Images are sorted by aspect ratio so
-    each one is only compared against others with a similar shape."""
+    each one is only compared against others with a similar shape. With
+    `same_size`, files of different byte sizes never match, however alike."""
     n = len(infos)
     parent = list(range(n))
 
@@ -473,6 +491,8 @@ def cluster(
             j = order[b]
             if infos[j].ratio > limit:
                 break
+            if same_size and infos[j].file_size != infos[i].file_size:
+                continue
             if (hi ^ infos[j].dhash).bit_count() <= threshold:
                 ri, rj = find(i), find(j)
                 if ri != rj:
@@ -526,6 +546,8 @@ def write_report(
         f".dup placeholders: {'created' if opts.dup else 'disabled (--no-dup)'}",
         f".bad files:        {'created' if opts.bad else 'disabled'}",
         f"Non-image files:   {'copied' if opts.copy_other else 'not copied'}",
+        f"Sub-directories:   {'scanned' if opts.recurse else 'not scanned (--no-subdirs)'}",
+        f"Require same size: {'yes (--require-same-size)' if opts.same_size else 'no'}",
         f"Elapsed time:      {format_duration(elapsed)}",
         "",
         f"Images scanned:               {scanned}",
@@ -599,9 +621,15 @@ def _run_scan(opts: Options, ui: ScanUI) -> int:
     ui.info("Sources:")
     for root in roots:
         ui.info(f"  {root}")
-    ui.info(f"Search results directory: {out_dir}\n")
+    ui.info(f"Search results directory: {out_dir}")
+    if not opts.recurse:
+        ui.info("Sub-directories are not being scanned (--no-subdirs)")
+    if opts.same_size:
+        ui.info("Images with different file sizes are treated as different "
+                "(--require-same-size)")
+    ui.info("")
 
-    files, others = gather_files(roots, out_dir, ui, opts.copy_other)
+    files, others = gather_files(roots, out_dir, ui, opts.copy_other, opts.recurse)
     found = f"Found {len(files)} image file(s)"
     if opts.copy_other:
         found += f" and {len(others)} other file(s)"
@@ -629,7 +657,8 @@ def _run_scan(opts: Options, ui: ScanUI) -> int:
         analysing.done()
 
         groups = cluster(
-            infos, opts.threshold, opts.ratio_tol, ui.progress("Comparing", len(infos))
+            infos, opts.threshold, opts.ratio_tol,
+            ui.progress("Comparing", len(infos)), opts.same_size,
         )
 
         # Sharpness only matters when there is a real choice to make.
@@ -953,7 +982,7 @@ class App:
         self._help_win = None
 
         root.title("Find Best Images")
-        root.minsize(760, 910)
+        root.minsize(760, 990)
         root.protocol("WM_DELETE_WINDOW", self._on_quit)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
@@ -1007,6 +1036,14 @@ class App:
                  "the source higher in the list is kept.",
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        self.norecurse_var = tk.BooleanVar(value=not self.base.recurse)
+        no_subdirs = ttk.Checkbutton(
+            frame, text="Don't scan sub-directories of the sources",
+            variable=self.norecurse_var,
+        )
+        no_subdirs.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._ttk_controls.append(no_subdirs)
+
     def _build_target(self, outer) -> None:
         frame = ttk.LabelFrame(outer, text="Target directory", padding=8)
         frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1046,12 +1083,15 @@ class App:
         self.other_var = tk.BooleanVar(value=self.base.copy_other)
         self.bad_var = tk.BooleanVar(value=self.base.bad)
         self.awake_var = tk.BooleanVar(value=self.base.keep_awake)
+        self.same_size_var = tk.BooleanVar(value=self.base.same_size)
         self.dry_var = tk.BooleanVar(value=self.base.dry_run)
         checks = [
             ("Create .dup files for look-alikes that aren't kept", self.dup_var),
             ("Copy non-image files to the target as well", self.other_var),
             ("Create .bad files for images that can't be read", self.bad_var),
             ("Keep the computer awake while scanning", self.awake_var),
+            ("Treat images with different file sizes as different images",
+             self.same_size_var),
             ("Dry run (don't create any files)", self.dry_var),
         ]
         for row, (text, var) in enumerate(checks):
@@ -1200,6 +1240,8 @@ class App:
         self.other_var.set(defaults.copy_other)
         self.bad_var.set(defaults.bad)
         self.awake_var.set(defaults.keep_awake)
+        self.norecurse_var.set(not defaults.recurse)
+        self.same_size_var.set(defaults.same_size)
         self.dry_var.set(defaults.dry_run)
         low, high = self._threshold_range(defaults.threshold)
         self.threshold_scale.configure(from_=low, to=high)
@@ -1210,34 +1252,50 @@ class App:
         self.status_var.set("Defaults restored")
 
     def show_help(self) -> None:
-        """Open (or raise) a read-only window with the option usage."""
+        """Open (or raise) a read-only window with the program name and version,
+        a description, the option usage, and a note about how it was made."""
         if self._help_win is not None and self._help_win.winfo_exists():
             self._help_win.deiconify()
             self._help_win.lift()
             self._help_win.focus_set()
             return
         win = tk.Toplevel(self.root)
-        win.title("Find Best Images - Help")
+        win.title(f"{APP_NAME} - Help")
         win.transient(self.root)
         win.columnconfigure(0, weight=1)
         win.rowconfigure(0, weight=1)
         frame = ttk.Frame(win, padding=8)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        try:
+            name = ttk.Label(header, text=APP_NAME, font="TkHeadingFont")
+        except tk.TclError:  # a Tk without that named font
+            name = ttk.Label(header, text=APP_NAME)
+        name.grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"Version {__version__}", foreground="#555555").grid(
+            row=0, column=1, sticky="w", padx=(10, 0))
 
         text = tk.Text(frame, width=92, height=30, wrap="none", font="TkFixedFont")
-        text.grid(row=0, column=0, sticky="nsew")
+        text.grid(row=1, column=0, sticky="nsew")
         down = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        down.grid(row=0, column=1, sticky="ns")
+        down.grid(row=1, column=1, sticky="ns")
         across = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
-        across.grid(row=1, column=0, sticky="ew")
+        across.grid(row=2, column=0, sticky="ew")
         text.configure(yscrollcommand=down.set, xscrollcommand=across.set)
         text.insert("1.0", help_text())
         text.configure(state="disabled")  # read-only, but still selectable/copyable
 
-        ttk.Button(frame, text="Close", command=win.destroy).grid(
-            row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        footer = ttk.Frame(frame)
+        footer.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, text=AI_NOTE, foreground="#555555").grid(
+            row=0, column=0, sticky="w")
+        ttk.Button(footer, text="Close", command=win.destroy).grid(
+            row=0, column=1, sticky="e")
         win.bind("<Escape>", lambda _e: win.destroy())
         self._help_win = win
 
@@ -1254,6 +1312,8 @@ class App:
             copy_other=bool(self.other_var.get()),
             bad=bool(self.bad_var.get()),
             keep_awake=bool(self.awake_var.get()),
+            recurse=not bool(self.norecurse_var.get()),
+            same_size=bool(self.same_size_var.get()),
             dry_run=bool(self.dry_var.get()),
             verbose=self.base.verbose,
             spawn=True,
@@ -1470,7 +1530,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(default 5; lower = stricter)",
     )
     optional.add_argument(
-        "--lossless-bonus", "--png-bonus", dest="lossless_bonus", type=float,
+        "--lossless-bonus", dest="lossless_bonus", type=float,
         default=Options.lossless_bonus, metavar="X",
         help="pixel-count multiplier for lossless formats (PNG, BMP, GIF, lossless "
         "TIFF/WebP) when ranking, to favour them over lossy ones such as JPG "
@@ -1489,18 +1549,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="don't create .dup placeholder files for look-alikes that weren't kept",
     )
     optional.add_argument(
-        "-c", "--copy-other", action=argparse.BooleanOptionalAction,
-        default=Options.copy_other,
-        help="also copy every non-image file found under the sources into "
-        "'search-result', keeping its relative path (on by default; "
-        "--no-copy-other turns it off)",
+        "--no-copy-other", dest="copy_other", action="store_false",
+        help="don't copy non-image files (by default every non-image file found "
+        "under the sources is copied into 'search-result', keeping its "
+        "relative path)",
     )
     optional.add_argument(
-        "-b", "--bad-files", dest="bad", action=argparse.BooleanOptionalAction,
-        default=Options.bad,
-        help="create a '<name>.bad' file in 'search-result' for each image that "
-        "can't be read; it holds the file's path and the error (on by default; "
-        "--no-bad-files turns it off)",
+        "--no-bad-files", dest="bad", action="store_false",
+        help="don't create '<name>.bad' files (by default each image that can't "
+        "be read gets one in 'search-result', holding its path and the error)",
+    )
+    optional.add_argument(
+        "--no-subdirs", dest="recurse", action="store_false",
+        help="scan only the top level of each source, not its sub-directories "
+        "(off by default: sub-directories are scanned)",
+    )
+    optional.add_argument(
+        "--require-same-size", dest="same_size", action="store_true",
+        help="treat two images with different file sizes as different images, "
+        "even if they look identical in every other way (off by default)",
     )
     optional.add_argument(
         "--allow-sleep", dest="keep_awake", action="store_false",
@@ -1521,38 +1588,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="list each group of look-alikes and the chosen file",
     )
     optional.add_argument(
+        "--version", action="version", version=f"{APP_NAME} {__version__}",
+        help="show the program name and version, then exit",
+    )
+    optional.add_argument(
         "-h", "--help", action="help", help="show this help message and exit"
     )
     return p
 
 
-GUI_CONTROL_HELP = """\
-WINDOW CONTROLS AND THEIR COMMAND-LINE OPTIONS
-  Sources list ............... -s / --source
-  Target directory ........... -t / --target
-  Create .dup files .......... --no-dup (turns it off)
-  Copy non-image files ....... -c / --copy-other, --no-copy-other
-  Create .bad files .......... -b / --bad-files, --no-bad-files
-  Keep the computer awake .... --allow-sleep (turns it off)
-  Dry run .................... -n / --dry-run
-  Match threshold ............ -T / --threshold
-  Lossless bonus ............. --lossless-bonus
-  --ratio-tol, --jobs and --verbose have no control in the window; they can
-  only be set on the command line; values given there still apply to scans
-  started from the window.
+GUI_CONTROLS = [  # (control in the window, matching command-line option)
+    ("Sources list", "-s / --source"),
+    ("Don't scan sub-directories", "--no-subdirs"),
+    ("Target directory", "-t / --target"),
+    ("Create .dup files", "--no-dup (turns it off)"),
+    ("Copy non-image files", "--no-copy-other (turns it off)"),
+    ("Create .bad files", "--no-bad-files (turns it off)"),
+    ("Keep the computer awake", "--allow-sleep (turns it off)"),
+    ("Different sizes = different images", "--require-same-size"),
+    ("Dry run", "-n / --dry-run"),
+    ("Match threshold", "-T / --threshold"),
+    ("Lossless bonus", "--lossless-bonus"),
+]
 
-COMMAND-LINE USAGE
-"""
+GUI_CONTROLS_NOTE = (
+    "--ratio-tol, --jobs and --verbose have no control in the window; they can "
+    "only be set on the command line, and values given there still apply to "
+    "scans started from the window."
+)
+
+ABOUT = (
+    f"{APP_NAME} looks through the folders you choose for pictures that look the "
+    "same, even when they differ in size, format or compression. From each group "
+    "of look-alikes it keeps the best one (highest resolution, lossless formats "
+    "favoured, then the sharpest) and copies it into a 'search-result' folder "
+    "that mirrors the original folder layout. The others get a small '.dup' note "
+    "pointing to the kept copy. Pictures with no look-alikes are copied as they "
+    "are. Optionally, other files are copied too, unreadable images get a '.bad' "
+    "note, and a report (search-report.txt) lists everything that was found."
+)
+
+# ANSI escape sequences (colours, bold, ...). A Tk Text widget can't interpret
+# them and would show them as stray characters.
+_ANSI_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _controls_table(width: int) -> str:
+    column = max(len(label) for label, _ in GUI_CONTROLS) + 4
+    rows = [f"  {(label + ' ').ljust(column, '.')} {option}" for label, option in GUI_CONTROLS]
+    return "\n".join(rows) + "\n" + textwrap.fill(
+        GUI_CONTROLS_NOTE, width=width, initial_indent="  ", subsequent_indent="  "
+    )
 
 
 def help_text(width: int = 90) -> str:
-    """The option usage shown by the window's Help button: a key to the
-    controls, followed by the same text as --help."""
+    """The text of the window's Help button: what the program does, a key to the
+    window's controls, then the same usage text as --help, as plain text."""
     parser = build_parser()
+    # Python 3.14+ argparse colours its help with ANSI codes when it thinks it is
+    # writing to a terminal (which it is, if the window was started from one).
+    # Older versions simply ignore this attribute.
+    parser.color = False
     parser.formatter_class = lambda prog: argparse.RawDescriptionHelpFormatter(
         prog, width=width
     )
-    return GUI_CONTROL_HELP + "\n" + parser.format_help()
+    text = (
+        "WHAT THIS PROGRAM DOES\n" + textwrap.fill(ABOUT, width=width) + "\n\n"
+        "WINDOW CONTROLS AND THEIR COMMAND-LINE OPTIONS\n"
+        + _controls_table(width) + "\n\n"
+        "COMMAND-LINE USAGE\n\n" + parser.format_help()
+    )
+    # Belt and braces: strip any escape sequences that still get through.
+    return _ANSI_ESCAPES.sub("", text)
 
 
 def options_from_args(args: argparse.Namespace) -> Options:
@@ -1569,6 +1676,8 @@ def options_from_args(args: argparse.Namespace) -> Options:
         dry_run=args.dry_run,
         verbose=args.verbose,
         keep_awake=args.keep_awake,
+        recurse=args.recurse,
+        same_size=args.same_size,
     )
 
 
