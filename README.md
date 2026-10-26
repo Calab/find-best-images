@@ -41,4 +41,4 @@ The following file types are considered to be images:  png, .jpg, .jpeg, .webp, 
 
 If a match is found between two different sources, and the match is a tie, the image in the first source will be selected.
 
-
+**This program was developed with the assistance of Claude AI**
