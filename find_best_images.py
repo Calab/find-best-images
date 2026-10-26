@@ -39,8 +39,9 @@ Selection rules for a group of look-alike images:
      (edge-detail score measured at a common size).
   3. If still tied, the larger file size wins.
   4. If still tied, the file from the source listed first wins: earlier -s
-     entries beat later ones (in the GUI, higher in the Sources list). Within
-     a single source, the alphabetically first path wins.
+     entries beat later ones (in the GUI, higher in the Sources list).
+  5. If still tied (so both are from the same source), the file in the deeper
+     folder wins; if the depth is equal too, the alphabetically first path.
 Images with no look-alikes are simply copied as-is.
 Every look-alike that was NOT chosen gets a small text placeholder at its own
 mirrored path with ".dup" appended, e.g.
@@ -381,6 +382,11 @@ class Info:
     def ratio(self) -> float:
         return self.width / self.height
 
+    @property
+    def depth(self) -> int:
+        """How many folders deep the file is below its source (0 = top level)."""
+        return len(self.path.relative_to(self.root).parts) - 1
+
 
 @dataclass
 class Options:
@@ -511,7 +517,7 @@ def cluster(
 def rank_key(info: Info, lossless_bonus: float):
     effective = info.pixels * (lossless_bonus if info.lossless else 1.0)
     resolution_bin = round(math.log(max(effective, 1)) / math.log(RESOLUTION_BIN))
-    return (resolution_bin, info.detail, info.file_size, -info.order)
+    return (resolution_bin, info.detail, info.file_size, -info.order, info.depth)
 
 
 # --------------------------------------------------------------------------
