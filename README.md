@@ -18,8 +18,8 @@ Options are:
 
 Command line options are:  
 --no-gui : Do not use the GUI  
--s / --source *DIR* [*DIR*] :  One or more source directories to scan  
--t / --target *DIR* :  Directory to store the search results  
+-s / --source *DIR* [*DIR*] :  One or more source directories to scan  (default ~/Pictures)  
+-t / --target *DIR* :  Directory to store the search results  (default ~)  
 --no-subdirs :  Do not scan subdirectories found in the source directories  
 --no-dup :  Do not create .dup image placeholders  
 --no-bad-files :  Do not create .bad image placeholders  
