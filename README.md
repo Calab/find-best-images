@@ -44,3 +44,5 @@ If a match is found between two different sources, and the match is a tie, the i
 The program processed 39,000 files in under 6 minutes on local disks in my system. It reduced my photo store from 95GB to 69GB.
 
 **This program was developed with the assistance of Claude AI**
+
+***YOU ARE ULTIMATELY RESPONSIBLE FOR THE SAFETY AND BACKUP OF YOUR FILES***
