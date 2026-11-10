@@ -65,8 +65,9 @@ If that isn't possible, the scan carries on and says so. Use --allow-sleep to
 turn this off.
 
 Requires: Python 3.10+ and Pillow  (pip install pillow)
-The window needs tkinter (bundled with most Python installs; on Debian/Ubuntu:
-sudo apt install python3-tk). With --no-gui it isn't needed.
+The window needs tkinter (bundled with the Windows and macOS Python installers;
+on Debian/Ubuntu: sudo apt install python3-tk). With --no-gui it isn't needed.
+Works on Linux, macOS and Windows (on Windows run it with: py find_best_images.py).
 """
 
 from __future__ import annotations
@@ -605,6 +606,35 @@ def write_report(
 # --------------------------------------------------------------------------
 # The scan itself (shared by the command line and the GUI)
 # --------------------------------------------------------------------------
+def _is_within(child: Path, parent: Path) -> bool:
+    """True if `child` is `parent` or lies somewhere below it. Symlinks are
+    resolved and, on Windows, case is ignored, so different spellings of the
+    same folder are recognised."""
+    def norm(p: Path) -> Path:
+        return Path(os.path.normcase(os.path.realpath(p)))
+
+    c, p = norm(child), norm(parent)
+    return c == p or p in c.parents
+
+
+def check_target_outside_sources(roots: list[Path], target: Path, out_dir: Path) -> None:
+    """Refuse to run if the results would be written inside a source folder (or
+    a source lies inside the results), since the scan would then read the files
+    it is writing."""
+    for root in roots:
+        if _is_within(out_dir, root):
+            raise ScanError(
+                f"the target directory ({target}) is inside the source directory "
+                f"{root}. Results would end up in the tree being scanned. Choose "
+                "a target outside every source directory."
+            )
+        if _is_within(root, out_dir):
+            raise ScanError(
+                f"the source directory {root} is inside the results directory "
+                f"{out_dir}. Choose a source outside the results directory."
+            )
+
+
 def _run_scan(opts: Options, ui: ScanUI) -> int:
     started = time.monotonic()
     base = Path(os.path.abspath(os.getcwd()))
@@ -623,6 +653,7 @@ def _run_scan(opts: Options, ui: ScanUI) -> int:
     if not roots:
         raise ScanError("no source directories were given")
     root_order = {root: n for n, root in enumerate(roots)}
+    check_target_outside_sources(roots, target, out_dir)
 
     ui.info("Sources:")
     for root in roots:
@@ -648,7 +679,9 @@ def _run_scan(opts: Options, ui: ScanUI) -> int:
     skipped = 0
     skipped_files: list[tuple[str, str]] = []
     context = multiprocessing.get_context("spawn") if opts.spawn else None
-    with ProcessPoolExecutor(max_workers=opts.jobs, mp_context=context) as pool:
+    # Windows can't wait on more than 61 worker processes at once.
+    workers = min(opts.jobs, 61) if sys.platform == "win32" else opts.jobs
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
         analysing = ui.progress("Analysing", len(paths))
         for path, w, h, dhash, err, lossless in pool.map(analyze, paths, chunksize=16):
             analysing.step()
@@ -939,7 +972,8 @@ class SourceList:
         if not path:
             return False
         norm = self.normalize(path)
-        if norm in self.items:
+        # normcase makes the comparison case-insensitive on Windows only
+        if os.path.normcase(norm) in {os.path.normcase(i) for i in self.items}:
             return False
         self.items.append(norm)
         return True
@@ -1471,6 +1505,13 @@ def launch_gui(opts: Options) -> int:
             file=sys.stderr,
         )
         return 1
+    if sys.platform == "win32":  # avoid a blurry, bitmap-scaled window on HiDPI screens
+        try:
+            import ctypes
+
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
+        except Exception:
+            pass
     try:
         root = tk.Tk()
     except tk.TclError as exc:
@@ -1634,6 +1675,15 @@ ABOUT = (
     "note, and a report (search-report.txt) lists everything that was found."
 )
 
+WINDOWS_NOTE = (
+    "By default Windows limits a full file path to 260 characters. Because the "
+    "results mirror the original folder layout inside 'search-result', a copied "
+    "file's path is longer than the original's, so files in deeply nested "
+    "folders may fail to copy. Such failures are reported in the log. To avoid "
+    "this, choose a target folder with a short path (for example C:\\results), "
+    "or on Windows 10 and later enable the 'Enable Win32 long paths' policy."
+)
+
 # ANSI escape sequences (colours, bold, ...). A Tk Text widget can't interpret
 # them and would show them as stray characters.
 _ANSI_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1662,6 +1712,7 @@ def help_text(width: int = 90) -> str:
         "WHAT THIS PROGRAM DOES\n" + textwrap.fill(ABOUT, width=width) + "\n\n"
         "WINDOW CONTROLS AND THEIR COMMAND-LINE OPTIONS\n"
         + _controls_table(width) + "\n\n"
+        "NOTE FOR WINDOWS USERS\n" + textwrap.fill(WINDOWS_NOTE, width=width) + "\n\n"
         "COMMAND-LINE USAGE\n\n" + parser.format_help()
     )
     # Belt and braces: strip any escape sequences that still get through.
@@ -1706,4 +1757,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # needed if packaged into a Windows .exe
+    # Windows consoles often use a legacy code page; a path with characters it
+    # can't show must not crash the program, so print a '?' instead.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     sys.exit(main())
